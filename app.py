@@ -33,12 +33,11 @@ def build_wound_mask_from_t0(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Identify the wound region at time 0.
-
     Steps:
         1. Sobel gradient
-        2. Threshold on low-gradient pixels (smooth gap)
-        3. Morphological cleanup
-        4. Keep largest connected component as wound
+        2. Lowest percentile = smooth gap
+        3. Morph cleanup
+        4. Keep largest connected component
     Returns:
         wound_mask (bool HxW)
         grad0 (float HxW)
@@ -48,7 +47,6 @@ def build_wound_mask_from_t0(
     thr = np.percentile(grad0, wound_low_grad_percentile)
     wound_candidate = grad0 < thr
 
-    # cleanup and smoothing
     wound_candidate = morphology.remove_small_objects(
         wound_candidate, min_size=min_wound_size
     )
@@ -75,8 +73,8 @@ def make_band_mask(
     band_thickness_px: int,
 ) -> np.ndarray:
     """
-    Build the ring just outside the wound.
-    Used as the confluent monolayer reference for normalization.
+    Build a ring just outside the wound. Used as the confluent monolayer
+    reference for normalization.
     """
     dilated = morphology.binary_dilation(
         wound_mask, morphology.disk(band_thickness_px)
@@ -88,20 +86,17 @@ def make_band_mask(
 def parse_hours_from_name(name: str) -> float:
     """
     Extract time (hours) from filename.
-
     Supports:
         - "01d00h00m" -> days + hours
         - "24H", "72 H" -> hours
     Fallback: 0
     """
-    # pattern "01d00h"
     m = re.search(r'(\d+)\s*[dD]\s*(\d+)\s*[hH]', name)
     if m:
         days = float(m.group(1))
         hours = float(m.group(2))
         return days * 24.0 + hours
 
-    # pattern "24H" / "72 H"
     m = re.search(r'(\d+)\s*[hH]', name)
     if m:
         return float(m.group(1))
@@ -118,8 +113,8 @@ def overlay_debug_rgb(
 ) -> Image.Image:
     """
     RGB overlay for QC:
-      - Wound region from t0 tinted blue
-      - Cells detected inside wound tinted green
+      - Wound region from t0 tinted blue (open region definition)
+      - Cells inside wound tinted green (closed area / closure)
     """
     base = np.array(img_pil.convert("RGB")).astype(np.float32)
     out = base.copy()
@@ -127,7 +122,9 @@ def overlay_debug_rgb(
     blue = np.array([0, 0, 255], dtype=np.float32)
     green = np.array([0, 255, 0], dtype=np.float32)
 
+    # First tint the entire wound band blue = open region at t0
     out[wound_mask] = (1 - alpha_wound) * out[wound_mask] + alpha_wound * blue
+    # Then override cell-covered wound area with green = closure
     out[wound_cells_mask] = (
         (1 - alpha_cells) * out[wound_cells_mask] + alpha_cells * green
     )
@@ -156,6 +153,7 @@ def analyze_timepoint(
     band_mask: np.ndarray,
     w0_frac: float,
     cell_percentile: float,
+    min_cell_size: int,
 ) -> Dict[str, float]:
     """
     Compute timepoint metrics.
@@ -173,8 +171,18 @@ def analyze_timepoint(
     grad = sobel(gray_blur)
     thr_cell = _cell_threshold(grad, band_mask, cell_percentile)
 
+    # raw cell masks
     wound_cells_mask = np.logical_and(wound_mask, grad > thr_cell)
     band_cells_mask = np.logical_and(band_mask, grad > thr_cell)
+
+    # --- KEY: remove tiny debris / noise (Incucyte ignores these) ---
+    if min_cell_size > 0:
+        wound_cells_mask = morphology.remove_small_objects(
+            wound_cells_mask, min_size=min_cell_size
+        )
+        band_cells_mask = morphology.remove_small_objects(
+            band_cells_mask, min_size=min_cell_size
+        )
 
     wound_area = wound_mask.sum()
     band_area = band_mask.sum() if band_mask.sum() > 0 else 1
@@ -197,6 +205,7 @@ def analyze_timepoint(
         "relative_wound_density_pct": float(rwd_pct),
         "w_frac": float(w_frac),
         "c_frac": float(c_frac),
+        "wound_cells_mask": wound_cells_mask,
     }
 
 
@@ -209,10 +218,12 @@ def run_full_analysis(
     min_wound_size: int,
     band_thickness_px: int,
     cell_percentile: float,
+    min_cell_size: int,
 ) -> Tuple[pd.DataFrame, List[Image.Image]]:
     """
     Full analysis for one well / condition.
     """
+    # sort by time from filename
     hours_list = [parse_hours_from_name(n) for n in names]
     order = np.argsort(hours_list)
 
@@ -222,6 +233,7 @@ def run_full_analysis(
 
     gray_series = [to_gray(im, gaussian_sigma) for im in images_sorted]
 
+    # wound from first timepoint
     wound_mask, _grad0 = build_wound_mask_from_t0(
         gray_series[0],
         wound_low_grad_percentile,
@@ -229,22 +241,34 @@ def run_full_analysis(
         min_wound_size,
     )
 
+    # reference band outside the wound
     band_mask = make_band_mask(wound_mask, band_thickness_px)
 
+    # baseline wound cell fraction w0
     grad_first = sobel(gray_series[0])
     thr_cell_first = _cell_threshold(grad_first, band_mask, cell_percentile)
     wound_cells_first = np.logical_and(wound_mask, grad_first > thr_cell_first)
+
+    if min_cell_size > 0:
+        wound_cells_first = morphology.remove_small_objects(
+            wound_cells_first, min_size=min_cell_size
+        )
+
     w0_frac = wound_cells_first.sum() / max(wound_mask.sum(), 1)
 
     rows = []
     overlays = []
-    for img_pil, gray_img, hr, nm in zip(images_sorted, gray_series, hours_sorted, names_sorted):
+
+    for img_pil, gray_img, hr, nm in zip(
+        images_sorted, gray_series, hours_sorted, names_sorted
+    ):
         metrics = analyze_timepoint(
             gray_img,
             wound_mask,
             band_mask,
             w0_frac=w0_frac,
             cell_percentile=cell_percentile,
+            min_cell_size=min_cell_size,
         )
 
         rows.append({
@@ -254,9 +278,8 @@ def run_full_analysis(
             "Relative Wound Density (%)": metrics["relative_wound_density_pct"],
         })
 
-        grad_now = sobel(gray_img)
-        thr_now = _cell_threshold(grad_now, band_mask, cell_percentile)
-        wound_cells_now = np.logical_and(wound_mask, grad_now > thr_now)
+        # overlay for QC (blue = wound region, green = closed wound)
+        wound_cells_now = metrics["wound_cells_mask"]
         ov = overlay_debug_rgb(img_pil, wound_mask, wound_cells_now)
         overlays.append(ov)
 
@@ -276,8 +299,8 @@ def plot_metric(
     scale: float,
 ):
     """
-    Line+marker plot for a single metric.
-    'scale' controls figure size.
+    Small line+marker plot for a single metric.
+    scale controls figure size.
     """
     fig_w = 4 * scale
     fig_h = 3 * scale
@@ -306,7 +329,7 @@ st.title("Wound Healing Analysis")
 
 st.write(
     "Quantifies scratch-wound closure over time for a single well / condition. "
-    "Outputs Wound Confluence (%), Calibrated Wound Confluence (%), and Relative Wound Density (%)."
+    "Outputs Wound Confluence (%) and Relative Wound Density (%)."
 )
 
 with st.form("analysis_form"):
@@ -320,10 +343,10 @@ with st.form("analysis_form"):
     st.markdown("### Analysis settings (optional)")
     st.caption(
         "Tweak only if the wound mask or cell detection looks off. "
-        "Defaults usually work."
+        "Defaults are tuned to approximate Incucyte for your RCC example."
     )
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
 
     with col1:
         gaussian_sigma = st.slider(
@@ -375,9 +398,21 @@ with st.form("analysis_form"):
             "Cell texture percentile",
             min_value=1,
             max_value=50,
-            value=10,
+            value=5,   # tuned default (was 10)
             step=1,
-            help="Lower = more sensitive to faint/transparent cells. Higher = stricter.",
+            help="Lower = more sensitive to faint/transparent cells (higher confluence). "
+                 "Higher = stricter.",
+        )
+
+    with col4:
+        min_cell_size = st.slider(
+            "Min cell object size (px)",
+            min_value=0,
+            max_value=500,
+            value=80,
+            step=10,
+            help="Objects smaller than this (in wound/band) are treated as debris and ignored. "
+                 "Increase to remove small specks; decrease if real cells are being removed.",
         )
 
     st.markdown("### Display settings")
@@ -401,34 +436,6 @@ with st.form("analysis_form"):
             help="How many overlay previews per row.",
         )
 
-    st.markdown("### Calibration (optional)")
-    st.caption(
-        "Apply a linear correction to Wound Confluence so values align with a reference "
-        "system (for example IncuCyte). Leave at defaults for no calibration."
-    )
-
-    cal_col1, cal_col2 = st.columns(2)
-    with cal_col1:
-        calib_slope = st.number_input(
-            "Confluence calibration slope",
-            min_value=0.0,
-            max_value=5.0,
-            value=1.0,
-            step=0.05,
-            help="Multiply raw Wound Confluence by this factor. "
-                 "For the RCC Vehicle dataset, ~1.40 works well.",
-        )
-    with cal_col2:
-        calib_intercept = st.number_input(
-            "Confluence calibration intercept",
-            min_value=-50.0,
-            max_value=50.0,
-            value=0.0,
-            step=0.5,
-            help="Add this offset after scaling. "
-                 "For the RCC Vehicle dataset, about -4.9 works well.",
-        )
-
     submitted = st.form_submit_button("Analyze")
 
 if submitted:
@@ -448,26 +455,16 @@ if submitted:
                 min_wound_size=min_wound_size,
                 band_thickness_px=band_thickness_px,
                 cell_percentile=cell_percentile,
+                min_cell_size=min_cell_size,
             )
         except Exception as e:
             st.error(f"Analysis failed: {e}")
         else:
-            # ---------------------------------
-            # Calibration layer on top of raw
-            # ---------------------------------
-            df_metrics["Calibrated Wound Confluence (%)"] = (
-                calib_slope * df_metrics["Wound Confluence (%)"] + calib_intercept
-            )
-
-            # ------------------------
-            # Metrics table + download
-            # ------------------------
             st.header("Metrics")
 
             styled = df_metrics.style.format({
                 "Hours": "{:.2f}",
                 "Wound Confluence (%)": "{:.2f}",
-                "Calibrated Wound Confluence (%)": "{:.2f}",
                 "Relative Wound Density (%)": "{:.2f}",
             })
             st.dataframe(styled, use_container_width=True)
@@ -480,56 +477,38 @@ if submitted:
                 mime="text/csv",
             )
 
-            # ------------------------
-            # Plots
-            # ------------------------
             st.header("Time-Series Plots")
 
             hours_arr = df_metrics["Hours"].to_numpy(dtype=float)
 
-            raw_conf = df_metrics["Wound Confluence (%)"].to_numpy(dtype=float)
-            cal_conf = df_metrics["Calibrated Wound Confluence (%)"].to_numpy(dtype=float)
+            conf_arr = df_metrics["Wound Confluence (%)"].to_numpy(dtype=float)
             rwd_arr = df_metrics["Relative Wound Density (%)"].to_numpy(dtype=float)
 
-            # Raw vs calibrated confluence side by side
             pcol1, pcol2 = st.columns(2)
             with pcol1:
-                fig_conf_raw = plot_metric(
+                fig_conf = plot_metric(
                     hours_arr,
-                    raw_conf,
-                    ylabel="Raw Wound Confluence (%)",
-                    title="Raw Wound Confluence vs Time",
+                    conf_arr,
+                    ylabel="Wound Confluence (%)",
+                    title="Wound Confluence vs Time",
                     scale=plot_scale,
                 )
-                st.pyplot(fig_conf_raw, clear_figure=True)
+                st.pyplot(fig_conf, clear_figure=True)
 
             with pcol2:
-                fig_conf_cal = plot_metric(
+                fig_rwd = plot_metric(
                     hours_arr,
-                    cal_conf,
-                    ylabel="Calibrated Wound Confluence (%)",
-                    title="Calibrated Wound Confluence vs Time",
+                    rwd_arr,
+                    ylabel="Relative Wound Density (%)",
+                    title="Relative Wound Density vs Time",
                     scale=plot_scale,
                 )
-                st.pyplot(fig_conf_cal, clear_figure=True)
+                st.pyplot(fig_rwd, clear_figure=True)
 
-            # RWD plot below
-            fig_rwd = plot_metric(
-                hours_arr,
-                rwd_arr,
-                ylabel="Relative Wound Density (%)",
-                title="Relative Wound Density vs Time",
-                scale=plot_scale,
-            )
-            st.pyplot(fig_rwd, clear_figure=True)
-
-            # ------------------------
-            # Overlays
-            # ------------------------
             st.header("Overlay QC")
             st.caption(
                 "Blue: wound region defined at first timepoint.  "
-                "Green: detected cells inside that wound region at each timepoint."
+                "Green: detected cells inside that wound region at each timepoint (closure)."
             )
 
             cols = st.columns(overlay_cols)
